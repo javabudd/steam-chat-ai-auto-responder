@@ -26,7 +26,7 @@ DEFAULT_PERSONA = (
 )
 
 DEFAULT_CLAUDE_MODEL = "claude-opus-4-7"
-DEFAULT_OLLAMA_MODEL = "gemma4:26b"
+DEFAULT_OLLAMA_MODEL = "gemma4"
 DEFAULT_OLLAMA_HOST = "http://localhost:11434"
 
 
@@ -116,13 +116,20 @@ def build_backend(args) -> "ClaudeBackend | OllamaBackend":
 
 def login(steam: SteamClient, username: str | None, fresh: bool) -> None:
     CREDENTIAL_DIR.mkdir(parents=True, exist_ok=True)
-    steam.set_credential_location(str(CREDENTIAL_DIR))
 
     if fresh:
         _clear_cached_session(username)
 
-    if not fresh and steam.relogin_available:
-        print("[*] Resuming cached Steam session...")
+    # `relogin_available` requires steam.username to be set, so resolve it
+    # before we set the credential location.
+    effective_username = username or _detect_cached_username()
+    if effective_username:
+        steam.username = effective_username
+
+    steam.set_credential_location(str(CREDENTIAL_DIR))
+
+    if not fresh and effective_username and steam.relogin_available:
+        print(f"[*] Resuming cached Steam session for {effective_username}...")
         result = steam.relogin()
         if result == 1:
             return
@@ -131,17 +138,43 @@ def login(steam: SteamClient, username: str | None, fresh: bool) -> None:
     print("[*] Starting interactive Steam login.")
     print("    You'll be prompted for your password, then a Steam Guard code")
     print("    (email code OR mobile-authenticator code, whichever your account uses).")
-    result = steam.cli_login(username=username) if username else steam.cli_login()
+    result = (
+        steam.cli_login(username=effective_username)
+        if effective_username
+        else steam.cli_login()
+    )
 
     if result != 1:
         print(f"[!] Login failed with result: {result}")
         sys.exit(1)
 
 
+def _detect_cached_username() -> str | None:
+    if not CREDENTIAL_DIR.exists():
+        return None
+    keys = sorted(
+        CREDENTIAL_DIR.glob("*.key"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not keys:
+        return None
+    if len(keys) > 1:
+        names = ", ".join(p.stem for p in keys)
+        print(
+            f"[*] Multiple cached Steam accounts found ({names}); "
+            f"using most recent: {keys[0].stem}. Pass --username to override."
+        )
+    return keys[0].stem
+
+
 def _clear_cached_session(username: str | None) -> None:
     if not CREDENTIAL_DIR.exists():
         return
-    patterns = [f"{username}_*"] if username else ["*"]
+    if username:
+        patterns = [f"{username}.key", f"{username}_sentry.bin", f"{username}_*"]
+    else:
+        patterns = ["*"]
     for pattern in patterns:
         for path in CREDENTIAL_DIR.glob(pattern):
             try:

@@ -151,24 +151,35 @@ def build_backend(args) -> "ClaudeBackend | OllamaBackend":
 
 def login(steam: SteamClient, username: str | None, fresh: bool) -> None:
     CREDENTIAL_DIR.mkdir(parents=True, exist_ok=True)
+    # set_credential_location persists the sentry file (Steam Guard machine
+    # fingerprint) but NOT the login_key — we handle the latter ourselves.
+    steam.set_credential_location(str(CREDENTIAL_DIR))
 
     if fresh:
         _clear_cached_session(username)
 
-    # `relogin_available` requires steam.username to be set, so resolve it
-    # before we set the credential location.
     effective_username = username or _detect_cached_username()
-    if effective_username:
-        steam.username = effective_username
 
-    steam.set_credential_location(str(CREDENTIAL_DIR))
+    # Persist the login_key whenever Steam issues a new one (initial login
+    # and on rotation).
+    @steam.on(steam.EVENT_NEW_LOGIN_KEY)
+    def _persist_key():
+        if steam.username and steam.login_key:
+            _save_login_key(steam.username, steam.login_key)
+            print(f"[*] Cached Steam login key for {steam.username}.")
 
-    if not fresh and effective_username and steam.relogin_available:
-        print(f"[*] Resuming cached Steam session for {effective_username}...")
-        result = steam.relogin()
-        if result == 1:
-            return
-        print(f"[!] Cached session rejected (result {result}). Falling back to full login.")
+    if not fresh and effective_username:
+        cached_key = _load_login_key(effective_username)
+        if cached_key:
+            print(f"[*] Resuming cached Steam session for {effective_username}...")
+            result = steam.login(username=effective_username, login_key=cached_key)
+            if result == 1:
+                return
+            print(f"[!] Cached login key rejected (result {result}). Falling back to full login.")
+            try:
+                _key_path(effective_username).unlink()
+            except OSError:
+                pass
 
     print("[*] Starting interactive Steam login.")
     print("    You'll be prompted for your password, then a Steam Guard code")
@@ -182,6 +193,30 @@ def login(steam: SteamClient, username: str | None, fresh: bool) -> None:
     if result != 1:
         print(f"[!] Login failed with result: {result}")
         sys.exit(1)
+
+
+def _key_path(username: str) -> Path:
+    return CREDENTIAL_DIR / f"{username}.key"
+
+
+def _load_login_key(username: str) -> str | None:
+    path = _key_path(username)
+    if not path.exists():
+        return None
+    try:
+        return path.read_text().strip() or None
+    except OSError:
+        return None
+
+
+def _save_login_key(username: str, key: str) -> None:
+    CREDENTIAL_DIR.mkdir(parents=True, exist_ok=True)
+    path = _key_path(username)
+    path.write_text(key)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
 
 
 def _detect_cached_username() -> str | None:

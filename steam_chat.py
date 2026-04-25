@@ -23,12 +23,9 @@ PRESETS_DIR = Path(__file__).resolve().parent / ".presets"
 PRESETS_FILE = PRESETS_DIR / "presets.json"
 
 BASE_PROMPT = (
-    "You are chatting with a friend on Steam. Reply casually and naturally, "
-    "like you would in a real Steam chat — short messages, lowercase is fine, "
-    "no essays, no bullet points, no formal structure. Don't mention that "
-    "you're an AI unless directly asked. "
-    "Always reply as a single message in flowing sentences. Never use line "
-    "breaks, newlines, or multiple paragraphs — one continuous message only."
+    "You are in a casual Steam chat. Rules: 1. Respond immediately with your message. "
+    "2. NEVER use the user's name, username, or any greeting. 3. No essays, lowercase preferred. "
+    "4. Single message only, no newlines. 5. Never admit to being an AI."
 )
 
 PERSONAS: dict[str, str] = {
@@ -182,11 +179,10 @@ class ChatSession:
     def system_prompt(self) -> str:
         with self._lock:
             persona = self._persona
-            friend = self._friend
+        # We removed the 'friend' variable and the final sentence here
         return (
             f"{self._base}\n\n"
-            f"{persona}\n\n"
-            f"The person you're chatting with is named '{friend}'."
+            f"{persona}"
         )
 
     def reply(self, message: str) -> str:

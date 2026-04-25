@@ -1,4 +1,4 @@
-# steam-test
+# steam-chat-ai-auto-responder
 
 AI-driven Steam chat bot. Logs into your Steam account, listens for messages
 from a specific friend (by persona name), and auto-replies using an LLM —

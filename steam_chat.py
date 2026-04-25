@@ -162,6 +162,15 @@ class ChatSession:
     def reset_history(self) -> None:
         self.history = []
 
+    def append_assistant(self, text: str) -> None:
+        """Add an assistant turn (e.g. a manually-sent /say message) to history."""
+        if self.history and self.history[-1]["role"] == "assistant":
+            self.history[-1]["content"] += "\n" + text
+        else:
+            self.history.append({"role": "assistant", "content": text})
+        if len(self.history) > 40:
+            self.history = self.history[-40:]
+
     def system_prompt(self) -> str:
         with self._lock:
             persona = self._persona
@@ -421,17 +430,21 @@ def main():
     steam.run_forever()
 
 
-def _resolve_friend(steam: SteamClient, name: str) -> None:
-    """Look up a persona name in the friends list and print resolution status."""
+def _find_friend(steam: SteamClient, name: str):
+    """Return the SteamUser matching the persona name, or None."""
     target = name.lower()
     try:
-        match = next(
+        return next(
             (f for f in list(steam.friends) if f.name and f.name.lower() == target),
             None,
         )
     except RuntimeError:
-        # friends list mutated mid-iteration; skip resolution
-        return
+        return None
+
+
+def _resolve_friend(steam: SteamClient, name: str) -> None:
+    """Look up a persona name in the friends list and print resolution status."""
+    match = _find_friend(steam, name)
     if match:
         print(f"[+] '{name}' resolved to {match.name} (SteamID {match.steam_id})")
     else:
@@ -480,11 +493,28 @@ def _command_loop(chat: "ChatSession", steam: SteamClient, shutdown) -> None:
                 chat.set_friend(arg)
                 print(f"[*] Now auto-replying to: {arg} (history cleared)")
                 _resolve_friend(steam, arg)
+        elif cmd == "say":
+            if not arg:
+                print("[!] Usage: /say <message>")
+                continue
+            friend_name = chat.get_friend()
+            match = _find_friend(steam, friend_name)
+            if not match:
+                print(f"[!] '{friend_name}' is not in your friends list — cannot send.")
+                continue
+            try:
+                match.send_message(arg)
+            except Exception as e:
+                print(f"[!] Failed to send: {e}")
+                continue
+            chat.append_assistant(arg)
+            print(f"<you>  {arg}")
         elif cmd == "reset":
             chat.reset_history()
             print("[*] Conversation history cleared.")
         elif cmd in ("help", "?"):
             print("Runtime commands:")
+            print("  /say <message>    Send a message to the current friend as yourself")
             print("  /preset <name>    Switch to a built-in persona")
             print("  /preset           Show current preset and list available")
             print("  /persona <text>   Set a custom persona")

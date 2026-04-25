@@ -184,6 +184,7 @@ press Enter:
 
 | Command | Effect |
 |---|---|
+| `/say <message>` | Send a message to the current friend yourself (added to history so the bot stays in sync) |
 | `/preset <name>` | Switch to a built-in persona |
 | `/preset` | Show current preset and list available |
 | `/persona <text>` | Set a custom persona |

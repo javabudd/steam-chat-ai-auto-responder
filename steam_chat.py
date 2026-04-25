@@ -1,8 +1,9 @@
 """
 AI-driven Steam chat bot. Logs in as a Steam user, listens for messages from
-a target friend (by persona name), and replies using Claude.
+a target friend (by persona name), and replies using an LLM (Claude or a
+local Ollama model).
 
-Usage: python steam_chat.py <friend_persona_name> [--username YOUR_STEAM] [--persona "..."]
+Usage: python steam_chat.py <friend_persona_name> [--backend claude|ollama] [options]
 """
 
 import argparse
@@ -11,7 +12,6 @@ import signal
 import sys
 from pathlib import Path
 
-import anthropic
 from steam.client import SteamClient
 from steam.client.user import SteamUser
 
@@ -25,36 +25,93 @@ DEFAULT_PERSONA = (
     "you're an AI unless directly asked."
 )
 
+DEFAULT_CLAUDE_MODEL = "claude-opus-4-7"
+DEFAULT_OLLAMA_MODEL = "gemma4:26b"
+DEFAULT_OLLAMA_HOST = "http://localhost:11434"
+
+
+class ClaudeBackend:
+    def __init__(self, model: str, thinking: bool):
+        import anthropic
+
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            raise RuntimeError("ANTHROPIC_API_KEY environment variable is not set.")
+        self._anthropic = anthropic
+        self._client = anthropic.Anthropic()
+        self._model = model
+        self._thinking = thinking
+
+    def describe(self) -> str:
+        mode = "adaptive thinking" if self._thinking else "thinking disabled"
+        return f"Claude ({self._model}, {mode})"
+
+    def generate(self, system_prompt: str, history: list[dict]) -> str:
+        kwargs = {
+            "model": self._model,
+            "max_tokens": 1024,
+            "system": system_prompt,
+            "messages": history,
+        }
+        if not self._thinking:
+            kwargs["thinking"] = {"type": "disabled"}
+        resp = self._client.messages.create(**kwargs)
+        return "".join(b.text for b in resp.content if b.type == "text").strip()
+
+    @property
+    def error_type(self):
+        return self._anthropic.APIError
+
+
+class OllamaBackend:
+    def __init__(self, model: str, host: str):
+        try:
+            import ollama
+        except ImportError as e:
+            raise RuntimeError(
+                "The 'ollama' package is required for --backend ollama. "
+                "Install it with: pip install ollama"
+            ) from e
+        self._ollama = ollama
+        self._client = ollama.Client(host=host)
+        self._model = model
+        self._host = host
+
+    def describe(self) -> str:
+        return f"Ollama ({self._model} @ {self._host})"
+
+    def generate(self, system_prompt: str, history: list[dict]) -> str:
+        messages = [{"role": "system", "content": system_prompt}, *history]
+        resp = self._client.chat(model=self._model, messages=messages)
+        return resp["message"]["content"].strip()
+
+    @property
+    def error_type(self):
+        return self._ollama.ResponseError
+
 
 class ChatSession:
-    def __init__(self, system_prompt: str, model: str, disable_thinking: bool):
-        self.client = anthropic.Anthropic()
+    def __init__(self, system_prompt: str, backend):
         self.system_prompt = system_prompt
-        self.model = model
-        self.disable_thinking = disable_thinking
+        self.backend = backend
         self.history: list[dict] = []
 
     def reply(self, message: str) -> str:
         self.history.append({"role": "user", "content": message})
-
-        kwargs = {
-            "model": self.model,
-            "max_tokens": 1024,
-            "system": self.system_prompt,
-            "messages": self.history,
-        }
-        if self.disable_thinking:
-            kwargs["thinking"] = {"type": "disabled"}
-
-        resp = self.client.messages.create(**kwargs)
-        text = "".join(
-            block.text for block in resp.content if block.type == "text"
-        ).strip()
-
+        text = self.backend.generate(self.system_prompt, self.history)
         self.history.append({"role": "assistant", "content": text})
         if len(self.history) > 40:
             self.history = self.history[-40:]
         return text
+
+
+def build_backend(args) -> "ClaudeBackend | OllamaBackend":
+    if args.backend == "claude":
+        model = args.model or DEFAULT_CLAUDE_MODEL
+        return ClaudeBackend(model=model, thinking=args.thinking)
+    if args.backend == "ollama":
+        model = args.model or DEFAULT_OLLAMA_MODEL
+        return OllamaBackend(model=model, host=args.ollama_host)
+    raise ValueError(f"Unknown backend: {args.backend}")
 
 
 def login(steam: SteamClient, username: str | None, fresh: bool) -> None:
@@ -98,12 +155,29 @@ def main():
     parser = argparse.ArgumentParser(description="AI-driven Steam chat bot")
     parser.add_argument("friend", help="Friend's Steam persona name (case-insensitive)")
     parser.add_argument("--username", help="Your Steam account name")
-    parser.add_argument("--persona", default=DEFAULT_PERSONA, help="System prompt for Claude")
-    parser.add_argument("--model", default="claude-opus-4-7", help="Claude model ID")
+    parser.add_argument("--persona", default=DEFAULT_PERSONA, help="System prompt for the LLM")
+    parser.add_argument(
+        "--backend",
+        choices=["claude", "ollama"],
+        default="claude",
+        help="LLM backend to use (default: claude)",
+    )
+    parser.add_argument(
+        "--model",
+        help=(
+            f"Model ID. Default for claude: {DEFAULT_CLAUDE_MODEL}. "
+            f"Default for ollama: {DEFAULT_OLLAMA_MODEL}."
+        ),
+    )
+    parser.add_argument(
+        "--ollama-host",
+        default=DEFAULT_OLLAMA_HOST,
+        help=f"Ollama server URL (default: {DEFAULT_OLLAMA_HOST})",
+    )
     parser.add_argument(
         "--thinking",
         action="store_true",
-        help="Enable adaptive thinking (slower replies, smarter answers)",
+        help="Enable adaptive thinking (claude only; slower, smarter replies)",
     )
     parser.add_argument(
         "--fresh-login",
@@ -112,8 +186,10 @@ def main():
     )
     args = parser.parse_args()
 
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("[!] ANTHROPIC_API_KEY environment variable is not set.")
+    try:
+        backend = build_backend(args)
+    except RuntimeError as e:
+        print(f"[!] {e}")
         sys.exit(1)
 
     target_name = args.friend.strip().lower()
@@ -124,15 +200,12 @@ def main():
     )
 
     steam = SteamClient()
-    chat = ChatSession(
-        system_prompt=system_prompt,
-        model=args.model,
-        disable_thinking=not args.thinking,
-    )
+    chat = ChatSession(system_prompt=system_prompt, backend=backend)
 
     @steam.on("logged_on")
     def handle_logged_on():
         print(f"[+] Logged on as {steam.user.name} (SteamID {steam.steam_id})")
+        print(f"[*] Backend: {backend.describe()}")
         print(f"[*] Auto-replying to messages from: {args.friend}")
         print("[*] Press Ctrl+C to exit.")
 
@@ -157,11 +230,11 @@ def main():
         print(f"<{user.name}> {text}")
         try:
             reply = chat.reply(text)
-        except anthropic.APIError as e:
-            print(f"[!] Claude API error: {e}")
+        except backend.error_type as e:
+            print(f"[!] Backend error: {e}")
             return
         if not reply:
-            print("[!] Empty reply from Claude, skipping.")
+            print("[!] Empty reply from backend, skipping.")
             return
         print(f"<you>  {reply}")
         user.send_message(reply)

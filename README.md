@@ -1,7 +1,9 @@
 # steam-test
 
 AI-driven Steam chat bot. Logs into your Steam account, listens for messages
-from a specific friend (by persona name), and auto-replies using Claude.
+from a specific friend (by persona name), and auto-replies using an LLM —
+either Anthropic's Claude API or a local model served by
+[Ollama](https://ollama.com).
 
 ## Install
 
@@ -57,9 +59,15 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Set API key
+## Configure a backend
 
-### Windows (persistent, PowerShell or cmd)
+Pick one of the two LLM backends.
+
+### Option A — Claude (default)
+
+Set your Anthropic API key:
+
+**Windows (persistent, PowerShell or cmd)**
 
 ```
 setx ANTHROPIC_API_KEY "sk-ant-..."
@@ -68,7 +76,7 @@ setx ANTHROPIC_API_KEY "sk-ant-..."
 Reopen the terminal after `setx`. For the current session only, use
 `$env:ANTHROPIC_API_KEY="sk-ant-..."` in PowerShell.
 
-### macOS / Linux
+**macOS / Linux**
 
 Current shell only:
 
@@ -84,10 +92,31 @@ echo 'export ANTHROPIC_API_KEY="sk-ant-..."' >> ~/.zshrc
 source ~/.zshrc
 ```
 
+### Option B — Ollama (local, no API key)
+
+Install Ollama from [ollama.com/download](https://ollama.com/download), then
+pull a model and make sure the server is running:
+
+```
+ollama pull gemma4:26b
+ollama serve        # usually auto-starts; run if not
+```
+
+By default the bot connects to `http://localhost:11434`. Override with
+`--ollama-host http://other-host:11434` if you run Ollama elsewhere.
+
 ## Run
+
+With Claude (default):
 
 ```
 python steam_chat.py "FriendsPersonaName"
+```
+
+With Ollama:
+
+```
+python steam_chat.py "FriendsPersonaName" --backend ollama
 ```
 
 First launch prompts for Steam username, password, and a **Steam Guard code**
@@ -106,20 +135,25 @@ Guard login. To force a fresh login manually, pass `--fresh-login`.
 
 - Listens for `chat_message` events; filters to only your target friend by
   persona name (case-insensitive).
-- Maintains conversation history (last 40 turns) so Claude has context.
-- Default model is `claude-opus-4-7` with thinking disabled for fast replies.
-  Add `--thinking` for smarter-but-slower answers, or `--model claude-sonnet-4-6`
-  for a cheaper chat model.
+- Maintains conversation history (last 40 turns) so the LLM has context.
 - Messages from other friends are ignored; only the named friend gets
   auto-replies.
+- Claude default: `claude-opus-4-7` with thinking disabled for fast replies.
+  Add `--thinking` for smarter-but-slower answers, or `--model claude-sonnet-4-6`
+  for a cheaper chat model.
+- Ollama default: `gemma4:26b` at `http://localhost:11434`. Any model you have
+  pulled will work (`--model llama3.2`, `--model qwen2.5`, etc.).
 
 ## Flags
 
+- `--backend {claude,ollama}` — choose the LLM backend (default: `claude`)
+- `--model <id>` — override the model. Claude default: `claude-opus-4-7`.
+  Ollama default: `gemma4:26b`.
+- `--ollama-host <url>` — Ollama server URL (default: `http://localhost:11434`)
+- `--thinking` — enable adaptive thinking (claude only)
 - `--username <steam-user>` — pass your Steam account name (skips one prompt)
 - `--persona "..."` — override the system prompt
   (e.g. `"You're a laconic DOTA player, short replies only"`)
-- `--model <id>` — swap models
-- `--thinking` — enable adaptive thinking
 - `--fresh-login` — clear cached session and force a Steam Guard login
 
 ## Caveats

@@ -23,7 +23,9 @@ BASE_PROMPT = (
     "You are chatting with a friend on Steam. Reply casually and naturally, "
     "like you would in a real Steam chat — short messages, lowercase is fine, "
     "no essays, no bullet points, no formal structure. Don't mention that "
-    "you're an AI unless directly asked."
+    "you're an AI unless directly asked. "
+    "Always reply as a single message in flowing sentences. Never use line "
+    "breaks, newlines, or multiple paragraphs — one continuous message only."
 )
 
 PERSONAS: dict[str, str] = {
@@ -61,7 +63,10 @@ PERSONAS: dict[str, str] = {
 
 DEFAULT_PRESET = "chill"
 
-DEFAULT_CLAUDE_MODEL = "claude-opus-4-7"
+DEFAULT_BUFFER_SECONDS = 2.5
+
+#DEFAULT_CLAUDE_MODEL = "claude-opus-4-7"
+DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 DEFAULT_OLLAMA_MODEL = "gemma4"
 DEFAULT_OLLAMA_HOST = "http://localhost:11434"
 
@@ -184,10 +189,52 @@ class ChatSession:
     def reply(self, message: str) -> str:
         self.history.append({"role": "user", "content": message})
         text = self.backend.generate(self.system_prompt(), self.history)
+        text = " ".join(text.split())
         self.history.append({"role": "assistant", "content": text})
         if len(self.history) > 40:
             self.history = self.history[-40:]
         return text
+
+
+class MessageBuffer:
+    """Debounce inbound messages so a flurry coalesces into one LLM call."""
+
+    def __init__(self, delay: float, on_flush):
+        self._delay = delay
+        self._on_flush = on_flush
+        self._lock = threading.Lock()
+        self._messages: list[str] = []
+        self._user = None
+        self._timer: threading.Timer | None = None
+
+    def add(self, user, text: str) -> None:
+        with self._lock:
+            self._messages.append(text)
+            self._user = user
+            if self._timer is not None:
+                self._timer.cancel()
+            self._timer = threading.Timer(self._delay, self._flush)
+            self._timer.daemon = True
+            self._timer.start()
+
+    def clear(self) -> None:
+        with self._lock:
+            self._messages = []
+            self._user = None
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+
+    def _flush(self) -> None:
+        with self._lock:
+            if not self._messages:
+                return
+            combined = "\n".join(self._messages)
+            user = self._user
+            self._messages = []
+            self._user = None
+            self._timer = None
+        self._on_flush(user, combined)
 
 
 def build_backend(args) -> "ClaudeBackend | OllamaBackend":
@@ -353,6 +400,16 @@ def main():
         action="store_true",
         help="Ignore cached session and force a full Steam Guard login",
     )
+    parser.add_argument(
+        "--buffer-seconds",
+        type=float,
+        default=DEFAULT_BUFFER_SECONDS,
+        help=(
+            f"Wait this long after each incoming message before replying, so "
+            f"rapid-fire messages coalesce into one reply (default: "
+            f"{DEFAULT_BUFFER_SECONDS}s). Set to 0 to disable."
+        ),
+    )
     args = parser.parse_args()
 
     try:
@@ -389,13 +446,9 @@ def main():
     def handle_friends_ready():
         _resolve_friend(steam, chat.get_friend())
 
-    @steam.on("chat_message")
-    def handle_message(user: SteamUser, text: str):
-        if not user.name or user.name.lower() != chat.target_name():
-            return
-        print(f"<{user.name}> {text}")
+    def respond(user: SteamUser, combined: str) -> None:
         try:
-            reply = chat.reply(text)
+            reply = chat.reply(combined)
         except backend.error_type as e:
             print(f"[!] Backend error: {e}")
             return
@@ -404,6 +457,18 @@ def main():
             return
         print(f"<you>  {reply}")
         user.send_message(reply)
+
+    buffer = MessageBuffer(args.buffer_seconds, respond) if args.buffer_seconds > 0 else None
+
+    @steam.on("chat_message")
+    def handle_message(user: SteamUser, text: str):
+        if not user.name or user.name.lower() != chat.target_name():
+            return
+        print(f"<{user.name}> {text}")
+        if buffer is not None:
+            buffer.add(user, text)
+        else:
+            respond(user, text)
 
     def shutdown(*_):
         print("\n[*] Shutting down...")
@@ -423,7 +488,7 @@ def main():
 
     threading.Thread(
         target=_command_loop,
-        args=(chat, steam, shutdown),
+        args=(chat, steam, buffer, shutdown),
         daemon=True,
     ).start()
 
@@ -454,7 +519,7 @@ def _resolve_friend(steam: SteamClient, name: str) -> None:
         )
 
 
-def _command_loop(chat: "ChatSession", steam: SteamClient, shutdown) -> None:
+def _command_loop(chat: "ChatSession", steam: SteamClient, buffer, shutdown) -> None:
     """Read /commands from stdin and apply them to the running session."""
     while True:
         try:
@@ -491,6 +556,8 @@ def _command_loop(chat: "ChatSession", steam: SteamClient, shutdown) -> None:
                 print(f"[*] Currently auto-replying to: {chat.get_friend()}")
             else:
                 chat.set_friend(arg)
+                if buffer is not None:
+                    buffer.clear()
                 print(f"[*] Now auto-replying to: {arg} (history cleared)")
                 _resolve_friend(steam, arg)
         elif cmd == "say":
@@ -511,6 +578,8 @@ def _command_loop(chat: "ChatSession", steam: SteamClient, shutdown) -> None:
             print(f"<you>  {arg}")
         elif cmd == "reset":
             chat.reset_history()
+            if buffer is not None:
+                buffer.clear()
             print("[*] Conversation history cleared.")
         elif cmd in ("help", "?"):
             print("Runtime commands:")

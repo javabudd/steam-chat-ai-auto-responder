@@ -139,6 +139,9 @@ class ChatSession:
         self.backend = backend
         self.history: list[dict] = []
         self._lock = threading.Lock()
+        # Bumped on /reset or /friend so an in-flight reply() knows its
+        # snapshot is stale and skips the commit.
+        self._generation = 0
 
     def set_persona(self, text: str, label: str) -> None:
         with self._lock:
@@ -152,8 +155,8 @@ class ChatSession:
     def set_friend(self, name: str) -> None:
         with self._lock:
             self._friend = name
-        # Different person → different conversation. Don't carry old history.
-        self.history = []
+            self.history = []
+            self._generation += 1
 
     def get_friend(self) -> str:
         with self._lock:
@@ -165,34 +168,43 @@ class ChatSession:
             return self._friend.lower()
 
     def reset_history(self) -> None:
-        self.history = []
+        with self._lock:
+            self.history = []
+            self._generation += 1
 
     def append_assistant(self, text: str) -> None:
         """Add an assistant turn (e.g. a manually-sent /say message) to history."""
-        if self.history and self.history[-1]["role"] == "assistant":
-            self.history[-1]["content"] += "\n" + text
-        else:
-            self.history.append({"role": "assistant", "content": text})
-        if len(self.history) > 40:
-            self.history = self.history[-40:]
-
-    def system_prompt(self) -> str:
         with self._lock:
-            persona = self._persona
-        # We removed the 'friend' variable and the final sentence here
-        return (
-            f"{self._base}\n\n"
-            f"{persona}"
-        )
+            if self.history and self.history[-1]["role"] == "assistant":
+                self.history[-1]["content"] += "\n" + text
+            else:
+                self.history.append({"role": "assistant", "content": text})
+            if len(self.history) > 40:
+                self.history = self.history[-40:]
 
-    def reply(self, message: str) -> str:
-        self.history.append({"role": "user", "content": message})
-        text = self.backend.generate(self.system_prompt(), self.history)
+    def reply(self, message: str):
+        """Generate a reply for `message`. Returns (text, commit) — call
+        `commit()` only after the reply was successfully delivered, to persist
+        the user/assistant turn pair. If /reset or /friend fired during
+        generation, `commit()` is a no-op so we don't corrupt the new state."""
+        with self._lock:
+            history_snapshot = list(self.history) + [{"role": "user", "content": message}]
+            generation = self._generation
+            persona = self._persona
+        prompt = f"{self._base}\n\n{persona}"
+        text = self.backend.generate(prompt, history_snapshot)
         text = " ".join(text.split())
-        self.history.append({"role": "assistant", "content": text})
-        if len(self.history) > 40:
-            self.history = self.history[-40:]
-        return text
+
+        def commit() -> None:
+            with self._lock:
+                if self._generation != generation:
+                    return
+                self.history.append({"role": "user", "content": message})
+                self.history.append({"role": "assistant", "content": text})
+                if len(self.history) > 40:
+                    self.history = self.history[-40:]
+
+        return text, commit
 
 
 class MessageBuffer:
@@ -262,8 +274,8 @@ def login(steam: SteamClient, username: str | None, fresh: bool) -> None:
     @steam.on(steam.EVENT_NEW_LOGIN_KEY)
     def _persist_key():
         if steam.username and steam.login_key:
-            _save_login_key(steam.username, steam.login_key)
-            print(f"[*] Cached Steam login key for {steam.username}.")
+            if _save_login_key(steam.username, steam.login_key):
+                print(f"[*] Cached Steam login key for {steam.username}.")
 
     if not fresh and effective_username:
         cached_key = _load_login_key(effective_username)
@@ -302,18 +314,23 @@ def _load_login_key(username: str) -> str | None:
         return None
     try:
         return path.read_text().strip() or None
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return None
 
 
-def _save_login_key(username: str, key: str) -> None:
+def _save_login_key(username: str, key: str) -> bool:
     CREDENTIAL_DIR.mkdir(parents=True, exist_ok=True)
     path = _key_path(username)
-    path.write_text(key)
+    try:
+        path.write_text(key)
+    except OSError as e:
+        print(f"[!] Failed to cache login key: {e}")
+        return False
     try:
         os.chmod(path, 0o600)
     except OSError:
         pass
+    return True
 
 
 def _load_saved_presets() -> dict[str, str]:
@@ -373,7 +390,7 @@ def _clear_cached_session(username: str | None) -> None:
     if not CREDENTIAL_DIR.exists():
         return
     if username:
-        patterns = [f"{username}.key", f"{username}_sentry.bin", f"{username}_*"]
+        patterns = [f"{username}.key", f"{username}_*"]
     else:
         patterns = ["*"]
     for pattern in patterns:
@@ -485,7 +502,7 @@ def main():
 
     def respond(user: SteamUser, combined: str) -> None:
         try:
-            reply = chat.reply(combined)
+            reply, commit = chat.reply(combined)
         except backend.error_type as e:
             print(f"[!] Backend error: {e}")
             return
@@ -493,7 +510,12 @@ def main():
             print("[!] Empty reply from backend, skipping.")
             return
         print(f"<you>  {reply}")
-        user.send_message(reply)
+        try:
+            user.send_message(reply)
+        except Exception as e:
+            print(f"[!] Failed to send: {e}")
+            return
+        commit()
 
     buffer = MessageBuffer(args.buffer_seconds, respond) if args.buffer_seconds > 0 else None
 
@@ -509,11 +531,14 @@ def main():
 
     def shutdown(*_):
         print("\n[*] Shutting down...")
+        sys.stdout.flush()
         try:
             steam.logout()
         except Exception:
             pass
-        sys.exit(0)
+        # os._exit so /quit from the daemon stdin thread actually terminates
+        # the process — sys.exit there would only kill that thread.
+        os._exit(0)
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
@@ -591,6 +616,9 @@ def _command_loop(chat: "ChatSession", steam: SteamClient, buffer, shutdown) -> 
                     continue
                 if sub_arg in PERSONAS:
                     print(f"[!] '{sub_arg}' is a built-in preset name. Choose a different name.")
+                    continue
+                if sub_arg in {"save", "delete"}:
+                    print(f"[!] '{sub_arg}' is a reserved subcommand name; a preset named that would be unreachable.")
                     continue
                 text, _ = chat.get_persona()
                 try:

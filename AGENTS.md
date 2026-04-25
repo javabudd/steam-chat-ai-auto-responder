@@ -13,9 +13,9 @@ Single-file Python CLI (`steam_chat.py`) that logs into Steam as a user, listens
 - `README.md` — install/run/flags/personas. Keep in sync when CLI flags or runtime commands change.
 - `.presets/presets.json` — user-saved personas (gitignored). Created on first `/preset save`.
 - `.claude/settings.local.json` — Claude Code harness settings, not app config.
-- `.venv/`, `__pycache__/` — gitignored.
+- `.venv/`, `__pycache__/` — gitignored. The venv has the project deps installed; the system `python` does not. Use `.venv/bin/python` for any local execution (`import` smoke tests, ad-hoc scripts, running the bot).
 
-There are no tests, no CI, no build step. `python steam_chat.py <FriendName>` is the only entry point.
+There are no tests, no CI, no build step. `.venv/bin/python steam_chat.py <FriendName>` is the only entry point.
 
 ## Mental model of `steam_chat.py`
 
@@ -36,7 +36,7 @@ Three threads matter:
 - Stdin reader: `_command_loop` daemon thread.
 - `MessageBuffer` timer thread (one-shot, replaced on each new message).
 
-`ChatSession._lock` guards `_persona`, `persona_label`, and `_friend`. `history` is mutated only on the Steam/buffer-flush path so it's effectively single-threaded; if you add another writer, lock it.
+`ChatSession._lock` guards all mutable session state: `_persona`, `persona_label`, `_friend`, `history`, and `_generation`. The Steam/buffer-flush path and the stdin command thread both write to `history`, so every mutation must hold the lock. `reply()` deliberately runs the slow LLM call *outside* the lock — it snapshots history+generation under the lock, generates, then re-acquires the lock to commit only if the generation hasn't changed (i.e. `/reset` or `/friend` didn't fire mid-flight). When you add new state, follow the same pattern: lock for read/write, and bump `_generation` if the change invalidates an in-flight reply.
 
 **Login must happen before the stdin thread starts.** `cli_login()` reads password / Steam Guard from stdin and the reader thread would otherwise eat those keystrokes. Don't reorder this in `main()`.
 
@@ -44,9 +44,11 @@ Three threads matter:
 
 - Single file. Don't split into a package unless there's a real reason — README, requirements, and the run command all assume `steam_chat.py`.
 - Backend classes share a duck-typed interface (`describe`, `generate`, `error_type`). Maintain it.
-- History cap at 40 turns is enforced in two places (`reply` and `append_assistant`) — keep them in sync.
+- History cap at 40 turns is enforced in two places (`reply`'s `commit` closure and `append_assistant`) — keep them in sync.
+- `reply()` returns `(text, commit)` and does not mutate history itself. The caller must call `commit()` only after the message was successfully delivered, so a failed `send_message` doesn't leave an assistant turn in history that the friend never received. Don't "simplify" this back to a side-effecting `reply()`.
 - Print-based UX: `[*]` info, `[+]` success, `[!]` warning/error, `<name> text` for chat lines. Match the existing style.
-- Built-in preset names in `PERSONAS` are reserved — `/preset save` and `/preset delete` reject collisions. Preserve that check if you touch preset code.
+- Built-in preset names in `PERSONAS` are reserved, and so are the literal subcommand names `save`/`delete` (a preset called `save` would be unreachable via `/preset save`). `/preset save` rejects both. Preserve that check if you touch preset code.
+- Shutdown uses `os._exit(0)` rather than `sys.exit(0)` so `/quit` from the daemon stdin thread actually terminates the process — `sys.exit` there only kills that one thread. Don't change it back.
 - `claude-sonnet-4-6` is the current Claude default; `claude-opus-4-7` is commented above it as the "more capable" alternative. Both are real model IDs — don't "correct" them.
 
 ## When making changes
@@ -56,4 +58,4 @@ Three threads matter:
 - Adding a built-in persona: append to `PERSONAS` and add a row to the README persona list.
 - Adding a backend: new class with the same three members, extend `--backend` choices, branch in `build_backend()`, document in README.
 
-No test suite to run. Smoke-test by `python steam_chat.py <FriendName>` against a real Steam account, or at minimum `python -c "import steam_chat"` after edits to catch syntax/import errors.
+No test suite to run. Smoke-test by `.venv/bin/python steam_chat.py <FriendName>` against a real Steam account, or at minimum `.venv/bin/python -c "import steam_chat"` after edits to catch syntax/import errors. (The system `python` is missing the deps — it will fail with `ModuleNotFoundError: No module named 'steam'`.)

@@ -407,13 +407,17 @@ def main():
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
+    # Log in BEFORE starting the stdin reader — otherwise the reader thread
+    # competes with cli_login's password/Steam Guard prompts for stdin and
+    # mangles your input.
+    login(steam, args.username, fresh=args.fresh_login)
+
     threading.Thread(
         target=_command_loop,
         args=(chat, steam, shutdown),
         daemon=True,
     ).start()
 
-    login(steam, args.username, fresh=args.fresh_login)
     steam.run_forever()
 
 
